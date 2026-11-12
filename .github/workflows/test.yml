@@ -11,6 +11,12 @@ on:
       commit:
         description: "A roc-lang/roc commit with a published build, its full hash."
         required: true
+      # roc-mac is a self-hosted Mac registered with this repository, used while
+      # GitHub hands this account no Apple silicon runner. Pass macos-15 to use
+      # GitHub's.
+      apple-silicon-runner:
+        description: "The runner label for the Apple silicon test."
+        default: roc-mac
 
 # Do not add permissions here! Configure them at the job level!
 permissions: {}
@@ -24,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15, windows-2025]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, "${{ inputs.apple-silicon-runner }}", windows-2025]
     defaults:
       run:
         shell: bash

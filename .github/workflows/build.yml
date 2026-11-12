@@ -19,6 +19,12 @@ on:
         description: "Build and replace the archives even when the release has them all."
         type: boolean
         default: false
+      # GitHub rarely hands this account an Apple silicon runner, so for now the
+      # default is roc-mac, a self-hosted runner on a Mac registered with this
+      # repository. Pass macos-15 to use GitHub's.
+      apple-silicon-runner:
+        description: "The runner label for the Apple silicon build."
+        default: roc-mac
 
 # Do not add permissions here! Configure them at the job level!
 permissions: {}
@@ -87,7 +93,7 @@ jobs:
         include:
           - os: macos-15-intel
             artifact_name: macos_x86_64
-          - os: macos-15
+          - os: ${{ inputs.apple-silicon-runner }}
             artifact_name: macos_apple_silicon
           - os: ubuntu-22.04
             artifact_name: linux_x86_64
