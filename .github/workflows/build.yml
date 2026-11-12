@@ -206,3 +206,32 @@ jobs:
           else
             gh release create "roc-$SHA" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "roc $SHORT" --notes "$notes" -- *
           fi
+
+      - name: Check out this repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: repo
+          ref: ${{ github.event.repository.default_branch }}
+
+      # The action checks every download against the sums committed here, so
+      # a caller that pins the action by commit pins the compilers as well.
+      # Callers pin the commit this step makes to use the new compiler. A
+      # forced rebuild replaces the sums, and callers pinned to an older
+      # commit then fail to download it until they move their pin.
+      - name: Commit the checksums
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        run: |
+          set -euo pipefail
+          cd repo
+          mkdir -p sums
+          cp ../archives/SHA256SUMS "sums/roc-$SHA.SHA256SUMS"
+          git add "sums/roc-$SHA.SHA256SUMS"
+          if git diff --cached --quiet; then
+            echo "sums/roc-$SHA.SHA256SUMS is up to date."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Add the checksums of roc $SHORT"
+          git push origin HEAD
+          echo "::notice::Pin niclas-ahden/roc-builds@$(git rev-parse HEAD) to use roc $SHORT."

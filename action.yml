@@ -2,7 +2,8 @@ name: Set up a Roc commit
 description: >-
   Put the Roc compiler of one roc-lang/roc commit on PATH: by default the one
   the repository's flake.lock locks as roc-src. It downloads the build that
-  niclas-ahden/roc-builds published for that commit. Without one it builds the
+  niclas-ahden/roc-builds published for that commit, checked against the
+  SHA-256 this version of the action holds for it. Without one it builds the
   commit from source and keeps the binary in this repository's Actions cache.
   Works on Linux, macOS and Windows.
 
@@ -61,6 +62,7 @@ runs:
       shell: bash
       env:
         URL: ${{ steps.pin.outputs.url }}
+        SHA: ${{ steps.pin.outputs.sha }}
         FOLDER: ${{ steps.pin.outputs.folder }}
         EXT: ${{ steps.pin.outputs.ext }}
       run: |
@@ -70,18 +72,27 @@ runs:
         dest="${RUNNER_TEMP//\\//}/roc-builds"
         mkdir -p "$dest"
         archive="$dest/$FOLDER.$EXT"
-        if curl -fsSL --retry 3 -o "$archive" "$URL"; then
-          # The release lists every archive's SHA-256. An archive that does not
-          # match it stops the job: it is not the compiler that was published.
-          curl -fsSL --retry 3 -o "$dest/SHA256SUMS" "${URL%/*}/SHA256SUMS"
-          expected=$(awk -v f="$FOLDER.$EXT" '$2 == f { print $1 }' "$dest/SHA256SUMS")
+        # The SHA-256 of every published archive is committed to this
+        # repository, in sums/, when the release is made. A caller pins this
+        # action by commit, so it pins the compilers too: a release whose
+        # archives are replaced afterwards no longer matches, and stops the
+        # job. The release's own SHA256SUMS could be replaced with them.
+        sums="${GITHUB_ACTION_PATH//\\//}/sums/roc-$SHA.SHA256SUMS"
+        expected=""
+        if [ -f "$sums" ]; then
+          expected=$(awk -v f="$FOLDER.$EXT" '$2 == f { print $1 }' "$sums")
+        fi
+        if [ -z "$expected" ]; then
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::This version of niclas-ahden/roc-builds holds no checksum for $FOLDER.$EXT, so this job builds the compiler. When the commit is published, pin the action to the roc-builds commit that added sums/roc-$SHA.SHA256SUMS. To publish it: gh workflow run build.yml -R niclas-ahden/roc-builds -f commit=$SHA"
+        elif curl -fsSL --retry 3 -o "$archive" "$URL"; then
           if command -v sha256sum > /dev/null; then
             actual=$(sha256sum "$archive" | cut -d " " -f 1)
           else
             actual=$(shasum -a 256 "$archive" | cut -d " " -f 1)
           fi
-          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-            echo "$FOLDER.$EXT has SHA-256 $actual, but the release's SHA256SUMS says '${expected:-nothing}'" >&2
+          if [ "$expected" != "$actual" ]; then
+            echo "$FOLDER.$EXT has SHA-256 $actual, but this action's sums/roc-$SHA.SHA256SUMS says $expected" >&2
             exit 1
           fi
           if [ "$EXT" = zip ]; then
@@ -93,8 +104,8 @@ runs:
           echo "$dest/$FOLDER" >> "$GITHUB_PATH"
           echo "found=true" >> "$GITHUB_OUTPUT"
         else
-          echo "found=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::niclas-ahden/roc-builds has not published this compiler, so this job builds it. To publish it for every repository: gh workflow run build.yml -R niclas-ahden/roc-builds -f commit=${{ steps.pin.outputs.sha }}"
+          echo "$URL could not be downloaded, though this action holds its checksum" >&2
+          exit 1
         fi
 
     # ------------------------------------------------------------ fallback
