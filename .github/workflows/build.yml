@@ -1,8 +1,9 @@
 name: Build a Roc commit
 
 # Builds one roc-lang/roc commit for every system our platforms run CI on and
-# publishes the archives as a release tagged with the commit's full hash, so
-# CI anywhere downloads that compiler instead of building it. The steps follow
+# publishes the archives as a release tagged roc-<full hash> (GitHub refuses a
+# tag that is a bare hash), so CI anywhere downloads that compiler instead of
+# building it. The steps follow
 # roc-lang/nightlies' nightly_new_compiler_all_os.yml, and so does the archive
 # layout, so a build looks like a nightly of the same commit.
 #
@@ -55,11 +56,11 @@ jobs:
             echo "roc-lang/roc $sha names no minimum_zig_version in build.zig.zon" >&2
             exit 1
           fi
-          published=$(gh release view "$sha" -R "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(startswith("roc-"))] | length' 2>/dev/null || echo 0)
+          published=$(gh release view "roc-$sha" -R "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(startswith("roc-"))] | length' 2>/dev/null || echo 0)
           skip=false
           if [ "$published" -ge 5 ] && [ "$FORCE" != true ]; then
             skip=true
-            echo "Release $sha already has its $published archives, nothing to build."
+            echo "Release roc-$sha already has its $published archives, nothing to build."
           fi
           echo "Building roc-lang/roc $sha with Zig $zig."
           {
@@ -193,9 +194,9 @@ jobs:
           \`\`\`
           $(cat SHA256SUMS)
           \`\`\`"
-          if gh release view "$SHA" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$SHA" -R "$GITHUB_REPOSITORY" --clobber -- *
-            gh release edit "$SHA" -R "$GITHUB_REPOSITORY" --notes "$notes"
+          if gh release view "roc-$SHA" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "roc-$SHA" -R "$GITHUB_REPOSITORY" --clobber -- *
+            gh release edit "roc-$SHA" -R "$GITHUB_REPOSITORY" --notes "$notes"
           else
-            gh release create "$SHA" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "roc $SHORT" --notes "$notes" -- *
+            gh release create "roc-$SHA" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "roc $SHORT" --notes "$notes" -- *
           fi

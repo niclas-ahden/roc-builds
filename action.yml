@@ -52,7 +52,7 @@ runs:
         {
           echo "sha=$sha"
           echo "folder=$folder"
-          echo "url=https://github.com/niclas-ahden/roc-builds/releases/download/$sha/$folder.$ext"
+          echo "url=https://github.com/niclas-ahden/roc-builds/releases/download/roc-$sha/$folder.$ext"
           echo "ext=$ext"
         } >> "$GITHUB_OUTPUT"
 

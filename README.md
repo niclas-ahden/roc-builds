@@ -27,7 +27,7 @@ gh workflow run build.yml -R niclas-ahden/roc-builds -f commit=<hash>
 ```
 
 builds the commit on every system with the Zig version its `build.zig.zon`
-names, and publishes a release tagged with the full hash. The steps and the
+names, and publishes a release tagged `roc-<full hash>`. The steps and the
 archive layout follow roc-lang/nightlies, so an archive holds the `roc` binary,
 roc's `LICENSE` and `legal_details`, and on macOS the Darwin sysroot. A commit
 that is already published is skipped unless the run passes `force`.
