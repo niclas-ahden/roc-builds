@@ -155,10 +155,20 @@ jobs:
           fi
           "$FOLDER"/roc version
 
+      # On macOS, tar stores extended attributes as ._ files that Linux tar
+      # unpacks as files. COPYFILE_DISABLE and --no-xattrs leave them out.
       - name: Compress (Unix)
         if: runner.os != 'Windows'
         run: |
-          tar -czf "$FOLDER.tar.gz" "$FOLDER"
+          if [ "$RUNNER_OS" = macOS ]; then
+            COPYFILE_DISABLE=1 tar --no-xattrs -czf "$FOLDER.tar.gz" "$FOLDER"
+          else
+            tar -czf "$FOLDER.tar.gz" "$FOLDER"
+          fi
+          if tar -tzf "$FOLDER.tar.gz" | grep -E '(^|/)\._'; then
+            echo "The archive holds macOS ._ files" >&2
+            exit 1
+          fi
           sha256sum "$FOLDER.tar.gz" 2>/dev/null || shasum -a 256 "$FOLDER.tar.gz"
 
       - name: Compress (Windows)
