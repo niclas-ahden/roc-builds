@@ -1,0 +1,196 @@
+name: Set up a Roc commit
+description: >-
+  Put the Roc compiler of one roc-lang/roc commit on PATH: by default the one
+  the repository's flake.lock locks as roc-src. It downloads the build that
+  niclas-ahden/roc-builds published for that commit. Without one it builds the
+  commit from source and keeps the binary in this repository's Actions cache.
+  Works on Linux, macOS and Windows.
+
+inputs:
+  commit:
+    description: >-
+      The roc-lang/roc commit, its full hash. Empty reads roc-src's locked
+      revision from flake.lock.
+    required: false
+    default: ""
+
+outputs:
+  commit:
+    description: The full hash of the commit whose compiler is on PATH.
+    value: ${{ steps.pin.outputs.sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the commit and the archive
+      id: pin
+      shell: bash
+      env:
+        COMMIT: ${{ inputs.commit }}
+      run: |
+        set -euo pipefail
+        sha="$COMMIT"
+        if [ -z "$sha" ]; then
+          sha=$(jq -r '.nodes["roc-src"].locked.rev' flake.lock)
+        fi
+        if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Not a full roc-lang/roc commit hash: '$sha'. Pass commit, or run where flake.lock locks roc-src." >&2
+          exit 1
+        fi
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) name=linux_x86_64 ext=tar.gz ;;
+          Linux-ARM64) name=linux_arm64 ext=tar.gz ;;
+          macOS-X64) name=macos_x86_64 ext=tar.gz ;;
+          macOS-ARM64) name=macos_apple_silicon ext=tar.gz ;;
+          Windows-X64) name=windows_x86_64 ext=zip ;;
+          *)
+            echo "roc-builds has no compiler for $RUNNER_OS-$RUNNER_ARCH" >&2
+            exit 1
+            ;;
+        esac
+        folder="roc-$name-${sha:0:7}"
+        {
+          echo "sha=$sha"
+          echo "folder=$folder"
+          echo "url=https://github.com/niclas-ahden/roc-builds/releases/download/$sha/$folder.$ext"
+          echo "ext=$ext"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Download the published build
+      id: download
+      shell: bash
+      env:
+        URL: ${{ steps.pin.outputs.url }}
+        FOLDER: ${{ steps.pin.outputs.folder }}
+        EXT: ${{ steps.pin.outputs.ext }}
+      run: |
+        set -euo pipefail
+        # RUNNER_TEMP is a backslash path on Windows, which neither this bash
+        # nor tar reads as one. Forward slashes work everywhere.
+        dest="${RUNNER_TEMP//\\//}/roc-builds"
+        mkdir -p "$dest"
+        archive="$dest/roc.$EXT"
+        if curl -fsSL --retry 3 -o "$archive" "$URL"; then
+          if [ "$EXT" = zip ]; then
+            7z x -y -o"$dest" "$archive" > /dev/null
+          else
+            tar -xzf "$archive" -C "$dest"
+          fi
+          rm "$archive"
+          echo "$dest/$FOLDER" >> "$GITHUB_PATH"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::niclas-ahden/roc-builds has not published this compiler, so this job builds it. To publish it for every repository: gh workflow run build.yml -R niclas-ahden/roc-builds -f commit=${{ steps.pin.outputs.sha }}"
+        fi
+
+    # ------------------------------------------------------------ fallback
+    # Without a published build, build the commit and keep it in this
+    # repository's Actions cache, keyed by commit and runner.
+    - name: Restore a compiler this repository built
+      if: steps.download.outputs.found != 'true'
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .roc-bin
+        key: roc-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}
+
+    - name: Read the Zig version the commit needs
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
+      id: zig
+      shell: bash
+      env:
+        SHA: ${{ steps.pin.outputs.sha }}
+      run: |
+        set -euo pipefail
+        zig=$(curl -fsSL "https://raw.githubusercontent.com/roc-lang/roc/$SHA/build.zig.zon" | sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p')
+        [ -n "$zig" ] || { echo "roc-lang/roc $SHA names no minimum_zig_version" >&2; exit 1; }
+        echo "version=$zig" >> "$GITHUB_OUTPUT"
+
+    - name: Check out the commit
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@v6
+      with:
+        repository: roc-lang/roc
+        ref: ${{ steps.pin.outputs.sha }}
+        path: .roc-src
+
+    - name: Install Zig for the compiler build
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ steps.zig.outputs.version }}
+        use-cache: true
+
+    - name: Remove the conflicting llvm-config
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux' && runner.arch == 'ARM64'
+      shell: bash
+      run: sudo rm -f /usr/lib/llvm-18/bin/llvm-config
+
+    - name: Build the compiler
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      working-directory: .roc-src
+      run: |
+        for attempt in 1 2 3; do
+          if zig build build-release; then
+            exit 0
+          fi
+          echo "Build attempt $attempt failed."
+          sleep 15
+        done
+        echo "The build failed 3 times." >&2
+        exit 1
+
+    # The MSVC environment is loaded with vcvars inside this one step. Do NOT
+    # use msvc-dev-cmd here: it exports the environment to every later step of
+    # the caller's job, and its VCINSTALLDIR makes rustc take the first
+    # `link.exe` on PATH, Git Bash's coreutils `link`, instead of MSVC's.
+    - name: Build the compiler (Windows)
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: cmd
+      working-directory: .roc-src
+      run: |
+        set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+        for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -property installationPath`) do set "VSPATH=%%i"
+        if not defined VSPATH (echo Visual Studio not found & exit /b 1)
+        call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+        set attempt=0
+        :retry
+        set /a attempt+=1
+        zig build build-release && exit /b 0
+        if %attempt% GEQ 3 (echo The build failed 3 times. & exit /b 1)
+        echo Build attempt %attempt% failed.
+        powershell -NoProfile -Command "Start-Sleep -Seconds 15"
+        goto retry
+
+    # The compiler looks for the Darwin sysroot next to itself. The checkout
+    # holds .roc sources of its own and would sit in the caller's workspace,
+    # so it goes once the binary is out.
+    - name: Assemble the compiler
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p .roc-bin
+        cp .roc-src/zig-out/bin/roc* .roc-bin/
+        if [ "$RUNNER_OS" = macOS ]; then
+          cp -r .roc-src/src/cli/darwin .roc-bin/
+        fi
+        rm -rf .roc-src
+
+    - name: Save the compiler to the cache
+      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: .roc-bin
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
+    - name: Put the built compiler on PATH
+      if: steps.download.outputs.found != 'true'
+      shell: bash
+      run: echo "$GITHUB_WORKSPACE/.roc-bin" >> "$GITHUB_PATH"
+
+    - name: Show the compiler
+      shell: bash
+      run: roc version

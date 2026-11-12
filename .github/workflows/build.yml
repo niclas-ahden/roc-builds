@@ -1,0 +1,201 @@
+name: Build a Roc commit
+
+# Builds one roc-lang/roc commit for every system our platforms run CI on and
+# publishes the archives as a release tagged with the commit's full hash, so
+# CI anywhere downloads that compiler instead of building it. The steps follow
+# roc-lang/nightlies' nightly_new_compiler_all_os.yml, and so does the archive
+# layout, so a build looks like a nightly of the same commit.
+#
+#   gh workflow run build.yml -R niclas-ahden/roc-builds -f commit=<hash>
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "The roc-lang/roc commit to build, its full or short hash."
+        required: true
+      force:
+        description: "Build and replace the archives even when the release has them all."
+        type: boolean
+        default: false
+
+# Do not add permissions here! Configure them at the job level!
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.commit }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve the commit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      zig: ${{ steps.resolve.outputs.zig }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve the commit, its Zig version and what is published
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.commit }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/roc-lang/roc/commits/$COMMIT" --jq .sha)
+          short=${sha:0:7}
+          # The compiler names the Zig it needs. Building with another one
+          # fails or, worse, builds something else.
+          zig=$(curl -fsSL "https://raw.githubusercontent.com/roc-lang/roc/$sha/build.zig.zon" | sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p')
+          if [ -z "$zig" ]; then
+            echo "roc-lang/roc $sha names no minimum_zig_version in build.zig.zon" >&2
+            exit 1
+          fi
+          published=$(gh release view "$sha" -R "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(startswith("roc-"))] | length' 2>/dev/null || echo 0)
+          skip=false
+          if [ "$published" -ge 5 ] && [ "$FORCE" != true ]; then
+            skip=true
+            echo "Release $sha already has its $published archives, nothing to build."
+          fi
+          echo "Building roc-lang/roc $sha with Zig $zig."
+          {
+            echo "sha=$sha"
+            echo "short=$short"
+            echo "zig=$zig"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.artifact_name }})
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    env:
+      SHA: ${{ needs.resolve.outputs.sha }}
+      FOLDER: roc-${{ matrix.artifact_name }}-${{ needs.resolve.outputs.short }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            artifact_name: macos_x86_64
+          - os: macos-15
+            artifact_name: macos_apple_silicon
+          - os: ubuntu-22.04
+            artifact_name: linux_x86_64
+          - os: ubuntu-24.04-arm
+            artifact_name: linux_arm64
+          - os: windows-2022
+            artifact_name: windows_x86_64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out roc-lang/roc
+        uses: actions/checkout@v6
+        with:
+          repository: roc-lang/roc
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: roc-src
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ needs.resolve.outputs.zig }}
+          use-cache: true
+
+      # As in roc-lang/nightlies: a stray llvm-config on the arm64 Linux image
+      # breaks the build.
+      - name: Remove the conflicting llvm-config
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: sudo rm -f /usr/lib/llvm-18/bin/llvm-config
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Fetching Zig's dependency tarballs fails now and then, so retry.
+      - name: Build the compiler
+        working-directory: roc-src
+        run: |
+          for attempt in 1 2 3; do
+            if zig build build-release; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed."
+            sleep 15
+          done
+          echo "The build failed 3 times." >&2
+          exit 1
+
+      - name: Package the compiler
+        run: |
+          set -euo pipefail
+          mkdir -p "$FOLDER"
+          cp roc-src/zig-out/bin/roc* "$FOLDER"/
+          cp roc-src/LICENSE roc-src/legal_details "$FOLDER"/
+          # The compiler looks for the Darwin sysroot next to itself.
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp -r roc-src/src/cli/darwin "$FOLDER"/
+          fi
+          "$FOLDER"/roc version
+
+      - name: Compress (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar -czf "$FOLDER.tar.gz" "$FOLDER"
+          sha256sum "$FOLDER.tar.gz" 2>/dev/null || shasum -a 256 "$FOLDER.tar.gz"
+
+      - name: Compress (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          7z a -tzip "$FOLDER.zip" "$FOLDER"
+          sha256sum "$FOLDER.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FOLDER }}
+          path: ${{ env.FOLDER }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}
+          retention-days: 4
+
+  publish:
+    name: Publish the release
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: archives
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+          ZIG: ${{ needs.resolve.outputs.zig }}
+        run: |
+          set -euo pipefail
+          cd archives
+          sha256sum -- * > SHA256SUMS
+          notes="Built from roc-lang/roc [$SHORT](https://github.com/roc-lang/roc/commit/$SHA) with Zig $ZIG by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). The compiler is under roc's license, which every archive carries with its legal_details.
+
+          \`\`\`
+          $(cat SHA256SUMS)
+          \`\`\`"
+          if gh release view "$SHA" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$SHA" -R "$GITHUB_REPOSITORY" --clobber -- *
+            gh release edit "$SHA" -R "$GITHUB_REPOSITORY" --notes "$notes"
+          else
+            gh release create "$SHA" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "roc $SHORT" --notes "$notes" -- *
+          fi
