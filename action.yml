@@ -69,8 +69,21 @@ runs:
         # nor tar reads as one. Forward slashes work everywhere.
         dest="${RUNNER_TEMP//\\//}/roc-builds"
         mkdir -p "$dest"
-        archive="$dest/roc.$EXT"
+        archive="$dest/$FOLDER.$EXT"
         if curl -fsSL --retry 3 -o "$archive" "$URL"; then
+          # The release lists every archive's SHA-256. An archive that does not
+          # match it stops the job: it is not the compiler that was published.
+          curl -fsSL --retry 3 -o "$dest/SHA256SUMS" "${URL%/*}/SHA256SUMS"
+          expected=$(awk -v f="$FOLDER.$EXT" '$2 == f { print $1 }' "$dest/SHA256SUMS")
+          if command -v sha256sum > /dev/null; then
+            actual=$(sha256sum "$archive" | cut -d " " -f 1)
+          else
+            actual=$(shasum -a 256 "$archive" | cut -d " " -f 1)
+          fi
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "$FOLDER.$EXT has SHA-256 $actual, but the release's SHA256SUMS says '${expected:-nothing}'" >&2
+            exit 1
+          fi
           if [ "$EXT" = zip ]; then
             7z x -y -o"$dest" "$archive" > /dev/null
           else
@@ -90,12 +103,15 @@ runs:
     - name: Restore a compiler this repository built
       if: steps.download.outputs.found != 'true'
       id: cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .roc-bin
         key: roc-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}
 
-    - name: Read the Zig version the commit needs
+    # The Zig for the build is unpacked into a folder of its own and called by
+    # its path, so the caller's Zig stays the one on PATH. Its download is
+    # checked against the SHA-256 ziglang.org publishes for it.
+    - name: Get the Zig the commit needs
       if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
       id: zig
       shell: bash
@@ -103,24 +119,48 @@ runs:
         SHA: ${{ steps.pin.outputs.sha }}
       run: |
         set -euo pipefail
-        zig=$(curl -fsSL "https://raw.githubusercontent.com/roc-lang/roc/$SHA/build.zig.zon" | sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p')
-        [ -n "$zig" ] || { echo "roc-lang/roc $SHA names no minimum_zig_version" >&2; exit 1; }
-        echo "version=$zig" >> "$GITHUB_OUTPUT"
+        version=$(curl -fsSL "https://raw.githubusercontent.com/roc-lang/roc/$SHA/build.zig.zon" | sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p')
+        [ -n "$version" ] || { echo "roc-lang/roc $SHA names no minimum_zig_version" >&2; exit 1; }
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) key=x86_64-linux ;;
+          Linux-ARM64) key=aarch64-linux ;;
+          macOS-X64) key=x86_64-macos ;;
+          macOS-ARM64) key=aarch64-macos ;;
+          Windows-X64) key=x86_64-windows ;;
+          *) echo "no Zig for $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+        esac
+        entry=$(curl -fsSL https://ziglang.org/download/index.json | jq -c --arg v "$version" --arg k "$key" '.[$v][$k]')
+        url=$(jq -r .tarball <<< "$entry")
+        expected=$(jq -r .shasum <<< "$entry")
+        dest="${RUNNER_TEMP//\\//}/roc-builds-zig"
+        mkdir -p "$dest"
+        archive="$dest/${url##*/}"
+        curl -fsSL --retry 3 -o "$archive" "$url"
+        if command -v sha256sum > /dev/null; then
+          actual=$(sha256sum "$archive" | cut -d " " -f 1)
+        else
+          actual=$(shasum -a 256 "$archive" | cut -d " " -f 1)
+        fi
+        [ "$expected" = "$actual" ] || { echo "${url##*/} has SHA-256 $actual, ziglang.org says $expected" >&2; exit 1; }
+        if [ "${archive##*.}" = zip ]; then
+          7z x -y -o"$dest" "$archive" > /dev/null
+          exe=zig.exe
+        else
+          tar -xJf "$archive" -C "$dest"
+          exe=zig
+        fi
+        folder="${archive##*/}"
+        folder="${folder%.tar.xz}"
+        folder="${folder%.zip}"
+        echo "path=$dest/$folder/$exe" >> "$GITHUB_OUTPUT"
 
     - name: Check out the commit
       if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         repository: roc-lang/roc
         ref: ${{ steps.pin.outputs.sha }}
         path: .roc-src
-
-    - name: Install Zig for the compiler build
-      if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
-      uses: mlugg/setup-zig@v2
-      with:
-        version: ${{ steps.zig.outputs.version }}
-        use-cache: true
 
     - name: Remove the conflicting llvm-config
       if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux' && runner.arch == 'ARM64'
@@ -131,9 +171,11 @@ runs:
       if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
       shell: bash
       working-directory: .roc-src
+      env:
+        ZIG: ${{ steps.zig.outputs.path }}
       run: |
         for attempt in 1 2 3; do
-          if zig build build-release; then
+          if "$ZIG" build build-release; then
             exit 0
           fi
           echo "Build attempt $attempt failed."
@@ -150,6 +192,8 @@ runs:
       if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
       shell: cmd
       working-directory: .roc-src
+      env:
+        ZIG: ${{ steps.zig.outputs.path }}
       run: |
         set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
         for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -property installationPath`) do set "VSPATH=%%i"
@@ -158,7 +202,7 @@ runs:
         set attempt=0
         :retry
         set /a attempt+=1
-        zig build build-release && exit /b 0
+        "%ZIG%" build build-release && exit /b 0
         if %attempt% GEQ 3 (echo The build failed 3 times. & exit /b 1)
         echo Build attempt %attempt% failed.
         powershell -NoProfile -Command "Start-Sleep -Seconds 15"
@@ -181,7 +225,7 @@ runs:
 
     - name: Save the compiler to the cache
       if: steps.download.outputs.found != 'true' && steps.cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .roc-bin
         key: ${{ steps.cache.outputs.cache-primary-key }}
